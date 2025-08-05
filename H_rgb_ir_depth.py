@@ -29,7 +29,7 @@ IR_W,    IR_H    = 1024, 768              # IR   解像度 (Max)
 RGB_W,   RGB_H   = 1920, 1080             # RGB  解像度 (Max)
 FPS              = 30                     # 共通フレームレート
 FILE_PERIOD_MIN  = 1                      # 何分ごとにファイル分割
-VISUALIZE        = True                   # GUI プレビュー
+VISUALIZE        = False                  # GUI プレビュー
 # ---------------------------
 
 # ==== babyID / PCname を必須入力 ====
