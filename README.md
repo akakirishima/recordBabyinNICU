@@ -1,7 +1,8 @@
 # recordBabyinNICU
 
 Intel RealSense L515 を使って、NICU 環境で Depth、IR、RGB の各ストリームを記録するための Python スクリプト群です。  
-公開リポジトリとしての主役は [`H_rgb_ir_depth.py`](./H_rgb_ir_depth.py) で、Depth、IR、RGB を同時に保存します。
+公開リポジトリとしての主役は [`H_rgb_ir_depth.py`](./H_rgb_ir_depth.py) で、Depth、IR、RGB を同時に保存します。  
+帯域や欠損リスクを抑えたい場合は、安定優先プロファイルの [`stable_rgb_ir_depth.py`](./stable_rgb_ir_depth.py) を使えます。
 
 このリポジトリは録画コードの公開を目的としており、患者データや録画済みデータセットを公開するものではありません。
 
@@ -97,6 +98,15 @@ python H_rgb_ir_depth.py
 - プレビュー中に `q` を押すと停止します
 - `Ctrl+C` でも停止できます
 
+欠損リスクを抑えたい場合は、安定優先版も使えます。
+
+```bash
+python stable_rgb_ir_depth.py
+```
+
+`stable_rgb_ir_depth.py` のデフォルトは `RGB 1280x720 @ 30 fps`、`IR 1024x768 @ 15 fps`、`Depth 1024x768 @ 5 fps save target` です。  
+backlog 時は `RGB > IR > Depth` の優先度で、Depth、次に IR を先に削る設計です。
+
 ## Output Format
 
 [`H_rgb_ir_depth.py`](./H_rgb_ir_depth.py) の出力構造は以下です。
@@ -137,6 +147,7 @@ HDF5 には主に次の情報が入ります。
 このリポジトリには用途の異なる派生スクリプトも含まれます。
 
 - [`H_rgb_ir_depth.py`](./H_rgb_ir_depth.py): 推奨スクリプト。Depth、IR、RGB をまとめて記録
+- [`stable_rgb_ir_depth.py`](./stable_rgb_ir_depth.py): 安定優先版。`RGB > IR > Depth` の優先度で backlog 時に Depth、次に IR を先に削る
 - [`H_rgb_ir.py`](./H_rgb_ir.py): IR と RGB のみを記録
 - [`H_depth_ir_autosplit.py`](./H_depth_ir_autosplit.py): Depth と IR を中心に扱う派生版
 - [`lossless_RGB_IR_depth.py`](./lossless_RGB_IR_depth.py): 保存形式や FPS が異なる実験的バリエーション
