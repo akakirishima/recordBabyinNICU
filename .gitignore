@@ -1,28 +1,36 @@
-# ────────── 仮想環境 ──────────
+# Virtual environments
 .venv/
 venv/
 
-# ────────── Python 一般 ──────────
+# Python cache / bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 
-# ────────── ビルド成果物 ──────────
+# Build artifacts
 build/
 dist/
 *.egg-info/
 
-# ────────── データベースファイル ──────────
+# Database / local files
 *.sqlite3
 
-# ────────── Log / テンポラリ ──────────
+# Logs / temp files
 *.log
 *.tmp
 
-# ────────── IDE / エディタ ──────────
+# IDE / editors
 .vscode/
 .idea/
 
-# ────────── OS 固有ファイル ──────────
+# OS files
 .DS_Store
 Thumbs.db
+
+# Test / tooling caches
+.pytest_cache/
+
+# Local capture outputs if stored inside the repository
+data/
+output/
+recordings/
