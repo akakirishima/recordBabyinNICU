@@ -30,7 +30,6 @@ def get_file_start_time(filepath):
     """ファイル名（パス全体）から日時をパースする"""
     basename = os.path.basename(filepath)
     try:
-        # 正規表現で「YYYYMMDD_HHMMSS」のパターンを抽出
         match = re.search(r'(\d{8})_(\d{6})', basename)
         if match:
             time_str = match.group(1) + "_" + match.group(2)
@@ -38,23 +37,19 @@ def get_file_start_time(filepath):
     except Exception as e:
         print(f"タイムスタンプパースエラー ({basename}): {e}")
     
-    # 失敗時はファイルの修正日時
     return datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
 
 # 1. 階層を探索してRGBファイルのリストを再帰的に取得
-# 例: ./20260603/RGB/15/20260603_155043.mp4
 rgb_pattern = os.path.join(BASE_DIR, "[0-9]*", "RGB", "[0-9]*", "*.mp4")
 rgb_files = sorted(glob.glob(rgb_pattern))
 
 print(f"検出されたRGBファイル数: {len(rgb_files)}本")
 
-# 背景差分器の初期化（ループの外側で行い、12時間連続で学習させる）
+# 背景差分器の初期化
 fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
 
 # --- メイン解析ループ ---
 for rgb_path in rgb_files:
-    # 2. RGBのパスから対応するIRのパスを動的に生成
-    # 例: .../RGB/... -> .../IR/...
     ir_path = rgb_path.replace(f"{os.sep}RGB{os.sep}", f"{os.sep}IR{os.sep}")
     
     if not os.path.exists(ir_path):
@@ -80,15 +75,12 @@ for rgb_path in rgb_files:
         h_rgb, w_rgb = frame_rgb.shape[:2]
         h_ir,  w_ir  = frame_ir.shape[:2]
         
-        # RGBからIRへ座標変換するための倍率
         scale_x = w_ir / w_rgb
         scale_y = h_ir / h_rgb
-
 
         gray_ir = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2GRAY)
         fgmask = fgbg.apply(frame_rgb)
         
-        # モルフォロジー演算によるノイズ除去
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
         
@@ -102,11 +94,9 @@ for rgb_path in rgb_files:
                     cx_ir = int(M["m10"] / M["m00"] * scale_x)
                     cy_ir = int(M["m01"] / M["m00"] * scale_y)
                     
-                    # 配列の範囲外（IndexError）を防ぐための安全弁（クリッピング）
                     cx_ir = max(0, min(cx_ir, w_ir - 1))
                     cy_ir = max(0, min(cy_ir, h_ir - 1))
                     
-                    # IR輝度からの仮の深度計算（実環境に合わせてキャリブレーションが必要）
                     simulated_depth = (255 - gray_ir[cy_ir, cx_ir]) / 50.0 + 0.5 
                     
                     current_3d_pos = pixel_to_3d(cx_ir, cy_ir, simulated_depth)
@@ -129,26 +119,46 @@ for rgb_path in rgb_files:
     cap_rgb.release()
     cap_ir.release()
 
-print("全ファイルの解析が完了しました。グラフを描画します。")
+print("全ファイルの解析が完了しました。1時間ごとに分割してグラフを出力します。")
 
-# --- 3. CSVからデータを読み込んで間引き描画（メモリ対策） ---
-times = []
-momentums = []
-with open(OUTPUT_CSV, mode='r') as f:
+# --- 3. CSVデータを1時間（Hour）ごとにグループ化してプロット ---
+hourly_data = {}
+
+with open(OUTPUT_CSV, mode='r', encoding='utf-8') as f:
     reader = csv.reader(f)
     next(reader)
     for i, row in enumerate(reader):
-        # 130万点をすべて描画すると重いため、10フレームに1点（約0.3秒ごと）に間引く
+        # 描画軽量化のための間引き（10フレームに1点）
         if i % 10 == 0:
-            times.append(datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f"))
-            momentums.append(float(row[1]))
+            dt = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f")
+            val = float(row[1])
+            
+            # 「日付_時間」を辞書のキーにする (例: "20260603_15")
+            hour_key = dt.strftime("%Y%m%d_%H")
+            
+            if hour_key not in hourly_data:
+                hourly_data[hour_key] = {"times": [], "values": []}
+            
+            hourly_data[hour_key]["times"].append(dt)
+            hourly_data[hour_key]["values"].append(val)
 
-plt.figure(figsize=(15, 5))
-plt.plot(times, momentums, color="crimson", linewidth=0.5)
-plt.gcf().autofmt_xdate()
-plt.xlabel("Absolute Time")
-plt.ylabel("Momentum (kg·m/s)")
-plt.title("12-Hour Momentum Plot (Downsampled)")
-plt.grid(True, linestyle="--", alpha=0.5)
-plt.tight_layout()
-plt.show()
+# グループごとに個別グラフを出力
+for hour_key, data in hourly_data.items():
+    print(f"グラフ生成中: {hour_key}時台")
+    
+    plt.figure(figsize=(12, 4))
+    plt.plot(data["times"], data["values"], color="crimson", linewidth=0.7)
+    
+    # グラフの見た目調整
+    plt.gcf().autofmt_xdate()
+    plt.xlabel("Time")
+    plt.ylabel("Momentum (kg*m/s)")
+    plt.title(f"Momentum Plot - {hour_key}:00")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    
+    # 画像として保存 (例: momentum_plot_20260603_15.png)
+    plt.savefig(f"momentum_plot_{hour_key}.png", dpi=150)
+    plt.close()  # メモリ解放のために必ずクローズ
+
+print("すべての時間帯のグラフ保存が完了しました。")
