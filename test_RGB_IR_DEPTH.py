@@ -25,7 +25,7 @@ DEPTH_W, DEPTH_H = 1024, 768              # Depth 解像度 (Max)
 IR_W,    IR_H    = 1024, 768              # IR   解像度 (Max)
 RGB_W,   RGB_H   = 1920, 1080             # RGB  解像度 (Max)
 FPS              = 30                     # 共通フレームレート
-FILE_PERIOD_MIN  = 3                      # 何分ごとにファイル分割するか
+FILE_PERIOD_MIN  = 1                      # 何分ごとにファイル分割するか
 VISUALIZE        = True                   # GUI プレビュー (描画負荷対策入り)
 # ---------------------------
 
