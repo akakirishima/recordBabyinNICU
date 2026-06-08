@@ -1,164 +1,186 @@
+# -*- coding: utf-8 -*-
+"""
+Intel RealSense L515 録画データ対応・ノイズ対策済 運動量解析スクリプト
+（視差スパイク対策：0値線形補完 ＆ 移動平均フィルター搭載）
+"""
+
 import os
 import glob
 import datetime
-import cv2
+import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
-import re
+import h5py
 
 # --- 設定 ---
-BASE_DIR = "."                 # test.pyがあるディレクトリ（カレントフォルダ）
+BASE_DIR = r"D:/Dev/Data/babyID_example/20260608" 
 OUTPUT_CSV = "momentum_results.csv"
 OBJECT_MASS = 1.0              # 物体の質量 (kg)
-FPS = 30                       # 動画のフレームレート
 
-# カメラの内部パラメータ (L515の標準値例)
+# ノイズ対策用の設定パラメータ
+FILTER_WINDOW = 5              # 移動平均のウィンドウサイズ（5フレーム＝約0.16秒間の平滑化）
+
+# カメラの内部パラメータ (L515標準値)
 FX, FY, CX, CY = 460.0, 460.0, 320.0, 240.0
 
-# CSVファイルの初期化
-with open(OUTPUT_CSV, mode='w', newline='', encoding='utf-8') as f:
-    writer = csv.writer(f)
-    writer.writerow(["Timestamp", "Momentum(kg·m/s)"])
+def pixel_to_3d(x, y, depth_mm, scale):
+    """ピクセル座標とミリメートル深度からメートル単位の3次元座標を計算"""
+    depth_m = depth_mm * scale
+    if depth_m <= 0.05: # あまりに近すぎる、または0（無効値）は排除
+        return None
+    X = (x - CX) * depth_m / FX
+    Y = (y - CY) * depth_m / FY
+    return np.array([X, Y, depth_m])
 
-def pixel_to_3d(x, y, depth):
-    X = (x - CX) * depth / FX
-    Y = (y - CY) * depth / FY
-    return np.array([X, Y, depth])
-
-def get_file_start_time(filepath):
-    """ファイル名（パス全体）から日時をパースする"""
-    basename = os.path.basename(filepath)
-    try:
-        match = re.search(r'(\d{8})_(\d{6})', basename)
-        if match:
-            time_str = match.group(1) + "_" + match.group(2)
-            return datetime.datetime.strptime(time_str, "%Y%m%d_%H%M%S")
-    except Exception as e:
-        print(f"タイムスタンプパースエラー ({basename}): {e}")
-    
-    return datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
-
-# 1. 階層を探索してRGBファイルのリストを再帰的に取得
-rgb_pattern = os.path.join(BASE_DIR, "[0-9]*", "RGB", "[0-9]*", "*.mp4")
+# 1. 録画データの取得
+rgb_pattern = os.path.join(BASE_DIR, "RGB", "*", "*.mp4")
 rgb_files = sorted(glob.glob(rgb_pattern))
 
 print(f"検出されたRGBファイル数: {len(rgb_files)}本")
+if not rgb_files:
+    print("指定されたディレクトリに動画ファイルが見つかりません。")
+    exit()
 
 # 背景差分器の初期化
 fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
 
+# 解析結果を一時的に保持するリスト
+raw_timestamps = []
+raw_momentums = []
+
 # --- メイン解析ループ ---
 for rgb_path in rgb_files:
-    ir_path = rgb_path.replace(f"{os.sep}RGB{os.sep}", f"{os.sep}IR{os.sep}")
+    norm_path = rgb_path.replace("\\", "/")
+    h5_path = norm_path.replace("/RGB/", "/Depth/").replace(".mp4", ".h5").replace("/", os.sep)
     
-    if not os.path.exists(ir_path):
-        print(f"警告: 対応するIRファイルが見つかりません。スキップします: {os.path.basename(rgb_path)}")
+    if not os.path.exists(h5_path):
         continue
         
-    print(f"解析中: {os.path.basename(rgb_path)}")
+    print(f"データ抽出中: {os.path.basename(rgb_path)}")
     
-    cap_rgb = cv2.VideoCapture(rgb_path)
-    cap_ir = cv2.VideoCapture(ir_path)
+    cap_rgb = cv.VideoCapture(rgb_path)
+    fps = cap_rgb.get(cv.CAP_PROP_FPS)
+    if fps <= 0: fps = 30.0
+        
+    w_rgb = int(cap_rgb.get(cv.CAP_PROP_FRAME_WIDTH))
+    h_rgb = int(cap_rgb.get(cv.CAP_PROP_FRAME_HEIGHT))
     
-    file_start_time = get_file_start_time(rgb_path)
     prev_3d_pos = None
     frame_idx = 0
     
-    while True:
-        ret_rgb, frame_rgb = cap_rgb.read()
-        ret_ir, frame_ir = cap_ir.read()
+    with h5py.File(h5_path, "r") as h5f:
+        dscale = h5f.attrs.get("depth_scale", 0.00025)
+        depth_dset = h5f["depth"]
+        ts_color_dset = h5f["ts_color"]
+        total_h5_frames = depth_dset.shape[0]
         
-        if not ret_rgb or not ret_ir:
-            break
+        while True:
+            ret_rgb, frame_rgb = cap_rgb.read()
+            if not ret_rgb or frame_idx >= total_h5_frames:
+                break
+                
+            depth_frame = depth_dset[frame_idx]
+            h_depth, w_depth = depth_frame.shape[:2]
             
-        h_rgb, w_rgb = frame_rgb.shape[:2]
-        h_ir,  w_ir  = frame_ir.shape[:2]
-        
-        scale_x = w_ir / w_rgb
-        scale_y = h_ir / h_rgb
-
-        gray_ir = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2GRAY)
-        fgmask = fgbg.apply(frame_rgb)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel)
-        
-        contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 500:
-                M = cv2.moments(largest_contour)
-                if M["m00"] != 0:
-                    cx_ir = int(M["m10"] / M["m00"] * scale_x)
-                    cy_ir = int(M["m01"] / M["m00"] * scale_y)
-                    
-                    cx_ir = max(0, min(cx_ir, w_ir - 1))
-                    cy_ir = max(0, min(cy_ir, h_ir - 1))
-                    
-                    simulated_depth = (255 - gray_ir[cy_ir, cx_ir]) / 50.0 + 0.5 
-                    
-                    current_3d_pos = pixel_to_3d(cx_ir, cy_ir, simulated_depth)
-                    
-                    if prev_3d_pos is not None:
-                        distance = np.linalg.norm(current_3d_pos - prev_3d_pos)
-                        velocity = distance * FPS
-                        momentum = OBJECT_MASS * velocity
+            scale_x = w_depth / w_rgb
+            scale_y = h_depth / h_rgb
+            
+            fgmask = fgbg.apply(frame_rgb)
+            kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
+            fgmask = cv.morphologyEx(fgmask, cv.MORPH_OPEN, kernel)
+            
+            contours, _ = cv.findContours(fgmask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            
+            # 初期値としてこのフレームの運動量は0、位置はNoneで進める
+            momentum = 0.0
+            current_3d_pos = None
+            
+            if contours:
+                largest_contour = max(contours, key=cv.contourArea)
+                if cv.contourArea(largest_contour) > 500:
+                    M = cv.moments(largest_contour)
+                    if M["m00"] != 0:
+                        cx_depth = int(M["m10"] / M["m00"] * scale_x)
+                        cy_depth = int(M["m01"] / M["m00"] * scale_y)
+                        cx_depth = max(0, min(cx_depth, w_depth - 1))
+                        cy_depth = max(0, min(cy_depth, h_depth - 1))
                         
-                        frame_time = file_start_time + datetime.timedelta(seconds=(frame_idx / FPS))
+                        real_depth_val = depth_frame[cy_depth, cx_depth]
+                        current_3d_pos = pixel_to_3d(cx_depth, cy_depth, real_depth_val, dscale)
                         
-                        with open(OUTPUT_CSV, mode='a', newline='', encoding='utf-8') as f:
-                            writer = csv.writer(f)
-                            writer.writerow([frame_time.strftime("%Y-%m-%d %H:%M:%S.%f"), momentum])
-                            
+                        if current_3d_pos is not None and prev_3d_pos is not None:
+                            distance = np.linalg.norm(current_3d_pos - prev_3d_pos)
+                            velocity = distance * fps
+                            momentum = OBJECT_MASS * velocity
+            
+            # タイムスタンプの取得と記録
+            device_ts_ms = ts_color_dset[frame_idx]
+            frame_time = datetime.datetime.fromtimestamp(device_ts_ms / 1000.0)
+            
+            raw_timestamps.append(frame_time)
+            # 輪郭エッジの誤サンプリング（Depth=0や異常な距離ジャンプ）は一旦「NaN」か「0」にして保持
+            if contours and current_3d_pos is None and prev_3d_pos is not None:
+                # 視差ズレによる突発ノイズの可能性が高いため、無効値(NaN)としてマーク
+                raw_momentums.append(np.nan)
+            else:
+                raw_momentums.append(momentum)
+                if current_3d_pos is not None:
                     prev_3d_pos = current_3d_pos
-        
-        frame_idx += 1
-        
+            
+            frame_idx += 1
+            
     cap_rgb.release()
-    cap_ir.release()
 
-print("全ファイルの解析が完了しました。1時間ごとに分割してグラフを出力します。")
+if not raw_momentums:
+    print("有効なデータが解析されませんでした。")
+    exit()
+
+# --- 2. 視差スパイク・ノイズ対策アルゴリズム（信号処理） ---
+print("データクレンジング中（ノイズフィルタ処理）...")
+momentum_array = np.array(raw_momentums, dtype=float)
+
+# 対策 A: 視差ズレで発生した NaN（無効データ）を前後の線形補完で埋める
+nans = np.isnan(momentum_array)
+if np.any(nans):
+    # numpyのインターポレートでNaNを補完
+    x_indices = np.arange(len(momentum_array))
+    momentum_array[nans] = np.interp(x_indices[nans], x_indices[~nans], momentum_array[~nans])
+
+# 対策 B: 移動平均フィルターによるスムージング処理（突発スパイクの平滑化）
+kernel_ma = np.ones(FILTER_WINDOW) / FILTER_WINDOW
+smoothed_momentums = np.convolve(momentum_array, kernel_ma, mode='same')
+
+# クレンジング後のデータをCSVへ保存
+print(f"CSVファイルへ {len(smoothed_momentums)} 件の平滑化データを書き込み中...")
+with open(OUTPUT_CSV, mode='w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(["Timestamp", "Momentum(kg·m/s)"])
+    for ts, val in zip(raw_timestamps, smoothed_momentums):
+        writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S.%f"), val])
 
 # --- 3. CSVデータを1時間（Hour）ごとにグループ化してプロット ---
 hourly_data = {}
-
-with open(OUTPUT_CSV, mode='r', encoding='utf-8') as f:
-    reader = csv.reader(f)
-    next(reader)
-    for i, row in enumerate(reader):
-        # 描画軽量化のための間引き（10フレームに1点）
-        if i % 10 == 0:
-            dt = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f")
-            val = float(row[1])
-            
-            # 「日付_時間」を辞書のキーにする (例: "20260603_15")
-            hour_key = dt.strftime("%Y%m%d_%H")
-            
-            if hour_key not in hourly_data:
-                hourly_data[hour_key] = {"times": [], "values": []}
-            
-            hourly_data[hour_key]["times"].append(dt)
-            hourly_data[hour_key]["values"].append(val)
+for i, ts in enumerate(raw_timestamps):
+    if i % 10 == 0:  # 描画軽量化
+        hour_key = ts.strftime("%Y%m%d_%H")
+        if hour_key not in hourly_data:
+            hourly_data[hour_key] = {"times": [], "values": []}
+        hourly_data[hour_key]["times"].append(ts)
+        hourly_data[hour_key]["values"].append(smoothed_momentums[i])
 
 # グループごとに個別グラフを出力
 for hour_key, data in hourly_data.items():
     print(f"グラフ生成中: {hour_key}時台")
-    
     plt.figure(figsize=(12, 4))
     plt.plot(data["times"], data["values"], color="crimson", linewidth=0.7)
-    
-    # グラフの見た目調整
     plt.gcf().autofmt_xdate()
     plt.xlabel("Time")
     plt.ylabel("Momentum (kg*m/s)")
-    plt.title(f"Momentum Plot - {hour_key}:00")
+    plt.title(f"Noise-Filtered Momentum Plot - {hour_key}:00")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
-    
-    # 画像として保存 (例: momentum_plot_20260603_15.png)
     plt.savefig(f"momentum_plot_{hour_key}.png", dpi=150)
-    plt.close()  # メモリ解放のために必ずクローズ
+    plt.close()
 
-print("すべての時間帯のグラフ保存が完了しました。")
+print("すべての処理が完了しました。")
