@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Intel RealSense L515 録画データ対応・ノイズ対策済 運動量解析スクリプト
-（解析結果を各動画ファイルと全く同じフォルダへ自動格納する版）
+（全動画データ統合 ＆ 1時間ごと完全グラフ化マネジメント版）
 """
 
 import os
@@ -33,7 +33,7 @@ def pixel_to_3d(x, y, depth_mm, scale):
     Y = (y - CY) * depth_m / FY
     return np.array([X, Y, depth_m])
 
-# 1. 録画データの取得
+# 1. 録画データの探索
 rgb_pattern = os.path.join(TARGET_DIR, "RGB", "*", "*.mp4")
 rgb_files = sorted(glob.glob(rgb_pattern))
 
@@ -45,14 +45,15 @@ if not rgb_files:
 # 背景差分器の初期化
 fgbg = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=False)
 
-# --- メイン解析ループ ---
+# ★全動画のデータを一元管理するための巨大バッファ
+all_timestamps = []
+all_momentums = []
+
+# --- メイン解析ループ（全動画からデータを抽出） ---
 for rgb_path in rgb_files:
-    # 現在の動画ファイルが置かれているフォルダのパスを取得（★ここがポイント）
-    current_video_dir = os.path.dirname(rgb_path)
     video_basename = os.path.basename(rgb_path)
-    video_name_only = os.path.splitext(video_basename)[0]
     
-    # 互換性維持のためのパス変換
+    # パス変換
     norm_path = rgb_path.replace("\\", "/")
     h5_path = norm_path.replace("/RGB/", "/Depth/").replace(".mp4", ".h5").replace("/", os.sep)
     
@@ -60,7 +61,7 @@ for rgb_path in rgb_files:
         print(f"警告: 対応するH5が見つかりません。スキップ: {video_basename}")
         continue
         
-    print(f"データ抽出・解析中: {video_basename}")
+    print(f"データ抽出中: {video_basename}")
     
     cap_rgb = cv.VideoCapture(rgb_path)
     fps = cap_rgb.get(cv.CAP_PROP_FPS)
@@ -71,10 +72,6 @@ for rgb_path in rgb_files:
     
     prev_3d_pos = None
     frame_idx = 0
-    
-    # この動画専用のデータバッファ
-    video_timestamps = []
-    video_momentums = []
     
     with h5py.File(h5_path, "r") as h5f:
         dscale = h5f.attrs.get("depth_scale", 0.00025)
@@ -89,14 +86,12 @@ for rgb_path in rgb_files:
                 
             depth_frame = depth_dset[frame_idx]
             h_depth, w_depth = depth_frame.shape[:2]
-            
             scale_x = w_depth / w_rgb
             scale_y = h_depth / h_rgb
             
             fgmask = fgbg.apply(frame_rgb)
             kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
             fgmask = cv.morphologyEx(fgmask, cv.MORPH_OPEN, kernel)
-            
             contours, _ = cv.findContours(fgmask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
             
             momentum = 0.0
@@ -123,11 +118,11 @@ for rgb_path in rgb_files:
             device_ts_ms = ts_color_dset[frame_idx]
             frame_time = datetime.datetime.fromtimestamp(device_ts_ms / 1000.0)
             
-            video_timestamps.append(frame_time)
+            all_timestamps.append(frame_time)
             if contours and current_3d_pos is None and prev_3d_pos is not None:
-                video_momentums.append(np.nan)
+                all_momentums.append(np.nan)
             else:
-                video_momentums.append(momentum)
+                all_momentums.append(momentum)
                 if current_3d_pos is not None:
                     prev_3d_pos = current_3d_pos
             
@@ -135,48 +130,60 @@ for rgb_path in rgb_files:
             
     cap_rgb.release()
 
-    if not video_momentums:
-        continue
+if not all_momentums:
+    print("有効なデータが1件も解析されませんでした。")
+    exit()
 
-    # --- 2. 視差スパイク・ノイズ対策アルゴリズム（動画ごと） ---
-    momentum_array = np.array(video_momentums, dtype=float)
-    nans = np.isnan(momentum_array)
-    if np.any(nans):
-        x_indices = np.arange(len(momentum_array))
-        momentum_array[nans] = np.interp(x_indices[nans], x_indices[~nans], momentum_array[~nans])
+# --- 2. 視差スパイク・ノイズ対策アルゴリズム（全データ一括） ---
+print("\n全データのクレンジングとスムージングを実行中...")
+momentum_array = np.array(all_momentums, dtype=float)
+nans = np.isnan(momentum_array)
+if np.any(nans):
+    x_indices = np.arange(len(momentum_array))
+    momentum_array[nans] = np.interp(x_indices[nans], x_indices[~nans], momentum_array[~nans])
 
-    kernel_ma = np.ones(FILTER_WINDOW) / FILTER_WINDOW
-    smoothed_momentums = np.convolve(momentum_array, kernel_ma, mode='same')
+kernel_ma = np.ones(FILTER_WINDOW) / FILTER_WINDOW
+smoothed_momentums = np.convolve(momentum_array, kernel_ma, mode='same')
 
-    # ★ 出力先を「現在の動画と同じフォルダ」に指定
-    output_csv_path = os.path.join(current_video_dir, f"{video_name_only}_momentum.csv")
-    with open(output_csv_path, mode='w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Momentum(kg·m/s)"])
-        for ts, val in zip(video_timestamps, smoothed_momentums):
-            writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S.%f"), val])
+# マスターCSVの保存（TARGET_DIR 直下）
+output_csv_path = os.path.join(TARGET_DIR, "all_momentum_results.csv")
+with open(output_csv_path, mode='w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(["Timestamp", "Momentum(kg·m/s)"])
+    for ts, val in zip(all_timestamps, smoothed_momentums):
+        writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S.%f"), val])
+print(f"マスターCSVを保存しました: {output_csv_path}")
 
-    # --- 3. グラフ出力を時間ごとにグループ化して「動画と同じフォルダ」へ保存 ---
-    hourly_data = {}
-    for i, ts in enumerate(video_timestamps):
-        if i % 10 == 0:  # 描画軽量化
-            hour_key = ts.strftime("%Y%m%d_%H")
-            if hour_key not in hourly_data:
-                hourly_data[hour_key] = {"times": [], "values": []}
-            hourly_data[hour_key]["times"].append(ts)
-            hourly_data[hour_key]["values"].append(smoothed_momentums[i])
+# --- 3. 【大修正】データを1時間ごとに完全にグループ化してプロット ---
+print("\n1時間ごとの統合グラフを生成中...")
+hourly_data = {}
+for i, ts in enumerate(all_timestamps):
+    # グラフの描画が重くならないよう10フレームに1点間引き（必要なら 1 にすれば間引きなし）
+    if i % 10 == 0:  
+        hour_key = ts.strftime("%Y%m%d_%H")  # 例: "20260608_12"
+        if hour_key not in hourly_data:
+            hourly_data[hour_key] = {"times": [], "values": []}
+        hourly_data[hour_key]["times"].append(ts)
+        hourly_data[hour_key]["values"].append(smoothed_momentums[i])
 
-    for hour_key, data in hourly_data.items():
-        graph_path = os.path.join(current_video_dir, f"momentum_plot_{hour_key}.png")
-        plt.figure(figsize=(12, 4))
-        plt.plot(data["times"], data["values"], color="crimson", linewidth=0.7)
-        plt.gcf().autofmt_xdate()
-        plt.xlabel("Time")
-        plt.ylabel("Momentum (kg*m/s)")
-        plt.title(f"Noise-Filtered Momentum Plot - {hour_key}:00")
-        plt.grid(True, linestyle="--", alpha=0.5)
-        plt.tight_layout()
-        plt.savefig(graph_path, dpi=150)
-        plt.close()
+# 1時間ごとに切り分けられたグループごとにグラフを出力
+for hour_key, data in hourly_data.items():
+    # 例: TARGET_DIR / "momentum_plot_20260608_12.png"
+    graph_path = os.path.join(TARGET_DIR, f"momentum_plot_{hour_key}.png")
+    
+    plt.figure(figsize=(12, 4))
+    plt.plot(data["times"], data["values"], color="crimson", linewidth=0.7)
+    
+    # グラフの見た目調整
+    plt.gcf().autofmt_xdate()
+    plt.xlabel("Time")
+    plt.ylabel("Momentum (kg*m/s)")
+    plt.title(f"Noise-Filtered Momentum Plot - {hour_key[4:6]}/{hour_key[6:8]} {hour_key[9:]}:00")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    
+    plt.savefig(graph_path, dpi=150)
+    plt.close()
+    print(f"-> グラフを出力しました: {os.path.basename(graph_path)}")
 
-print("\nすべての処理が完了しました。各動画フォルダ内にCSVとグラフが保存されています。")
+print(f"\nすべての処理が完了しました。\nCSVおよび1時間ごとのグラフはすべて以下に保存されています：\n{TARGET_DIR}")
