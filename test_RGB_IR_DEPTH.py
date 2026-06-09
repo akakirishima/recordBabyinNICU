@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 ROOT_PATH        = r"D:/Dev/Data"         # データ保存先ルート
 DEPTH_W, DEPTH_H = 1024, 768              # Depth 解像度
 IR_W,    IR_H    = 1024, 768              # IR 解像度
-RGB_W,   RGB_H   = 1920, 1080             # RGB 解像度 (カクつく場合は 1280, 720 に落とす)
+RGB_W,   RGB_H   = 1280, 720             # RGB 解像度 ( max.1920, 1080)
 FPS              = 30                     # 共通フレームレート
 FILE_PERIOD_MIN  = 1                      # ★1分ごとにファイル分割
 VISUALIZE        = True                  # ★12時間撮影時は負荷軽減のため False を強く推奨
