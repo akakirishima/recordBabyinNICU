@@ -49,7 +49,7 @@ FPS = 30
 FILE_PERIOD_MIN = 1
 
 # 長時間録画はFalse推奨
-VISUALIZE = False
+VISUALIZE = True
 
 # SDK側の一時バッファ
 SDK_QUEUE_SIZE = 12
