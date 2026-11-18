@@ -1,0 +1,1067 @@
+
+# -*- coding: utf-8 -*-
+"""
+Intel RealSense L515
+連続撮影・非同期3ストリーム保存・1分分割
+
+Depth : HDF5 (uint16 / LZF)
+IR    : MP4
+RGB   : MP4
+
+追加機能:
+- Depth / IR / RGB 独立保存スレッド
+- 録画停止なしの1分分割
+- RealSense SDKフレームキュー
+- HDF5事前領域確保
+- フレーム番号・タイムスタンプ保存
+- 欠落と保存キューの監視
+- 保存途中ファイルの区別
+"""
+
+from __future__ import annotations
+
+import os
+import csv
+import time
+import queue
+import threading
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+
+import cv2 as cv
+import h5py
+import numpy as np
+import pyrealsense2 as rs
+
+
+# ============================================================
+# 1. 設定
+# ============================================================
+
+ROOT_PATH = r"D:/Dev/Data"
+
+DEPTH_W, DEPTH_H = 1024, 768
+IR_W, IR_H = 1024, 768
+RGB_W, RGB_H = 1280, 720
+
+FPS = 30
+FILE_PERIOD_MIN = 1
+
+# 長時間録画はFalse推奨
+VISUALIZE = False
+
+# SDK側の一時バッファ
+SDK_QUEUE_SIZE = 12
+
+# 各保存スレッドの最大待機フレーム数
+WRITE_QUEUE_SIZE = 48
+
+# IRをグレースケールのまま保存する
+# 映像が正常に再生できない環境ではFalseに変更
+IR_WRITE_GRAY = True
+
+# HDF5書き込み中のflush間隔
+H5_FLUSH_FRAMES = FPS * 5
+
+# 監視情報の出力間隔
+STATUS_INTERVAL_SEC = 5
+
+# 画面プレビューの間引き
+PREVIEW_EVERY = 6
+
+# OpenCVによる過剰なスレッド使用を抑制
+cv.setNumThreads(1)
+
+
+# ============================================================
+# 2. 共通データ
+# ============================================================
+
+@dataclass(frozen=True)
+class Segment:
+    index: int
+    prefix: str
+    base_dir: str
+
+
+@dataclass
+class FramePacket:
+    segment: Segment
+
+    depth: np.ndarray
+    ir: np.ndarray
+    rgb: np.ndarray
+
+    ts_depth: float
+    ts_ir: float
+    ts_color: float
+
+    no_depth: int
+    no_ir: int
+    no_color: int
+
+    wall_ns: int
+    mono_ns: int
+
+
+def mkdir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def open_video(path, width, height, is_color):
+    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+
+    writer = cv.VideoWriter(
+        path, cv.CAP_FFMPEG,
+        fourcc, FPS,
+        (width, height),
+        is_color
+    )
+
+    if not writer.isOpened():
+        writer.release()
+        writer = cv.VideoWriter(
+            path, fourcc, FPS,
+            (width, height), is_color
+        )
+
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"VideoWriterを開けません: {path}"
+        )
+
+    return writer
+
+
+def make_segment(index, wall_ns, baby_id):
+    dt = datetime.fromtimestamp(wall_ns / 1e9)
+    date_str = dt.strftime("%Y%m%d")
+    prefix = dt.strftime("%Y%m%d_%H%M%S")
+
+    base_dir = os.path.join(
+        ROOT_PATH, baby_id, date_str
+    )
+
+    return Segment(index, prefix, base_dir)
+
+
+# ============================================================
+# 3. 保存スレッド
+# ============================================================
+
+class SaveWorker(threading.Thread):
+
+    def __init__(
+        self, kind, stop_event, manifest_path,
+        manifest_lock, device_info
+    ):
+        super().__init__(
+            name=f"Save-{kind}",
+            daemon=False
+        )
+
+        self.kind = kind
+        self.q = queue.Queue(maxsize=WRITE_QUEUE_SIZE)
+
+        self.stop_event = stop_event
+        self.manifest_path = manifest_path
+        self.manifest_lock = manifest_lock
+        self.device_info = device_info
+
+        self.error = None
+
+        self.segment = None
+        self.writer = None
+        self.h5 = None
+        self.depth_ds = None
+        self.meta_ds = {}
+
+        self.temp_path = None
+        self.final_path = None
+
+        self.n = 0
+        self.total_saved = 0
+
+        self.first_ns = 0
+        self.last_ns = 0
+
+        self.last_info_date = None
+
+    # --------------------------------------------------------
+    # ファイル開始
+    # --------------------------------------------------------
+
+    def start_segment(self, packet):
+
+        seg = packet.segment
+
+        folder_name = {
+            "depth": "Depth",
+            "ir": "IR",
+            "rgb": "RGB"
+        }[self.kind]
+
+        extension = (
+            ".h5" if self.kind == "depth" else ".mp4"
+        )
+
+        hour = seg.prefix[9:11]
+
+        folder = os.path.join(
+            seg.base_dir, folder_name, hour
+        )
+        mkdir(folder)
+
+        self.final_path = os.path.join(
+            folder, seg.prefix + extension
+        )
+
+        # VideoWriterがコンテナ形式を判別できるよう、
+        # 一時ファイルでも末尾の拡張子を維持する
+        self.temp_path = os.path.join(
+            folder, seg.prefix + ".partial" + extension
+        )
+
+        # 既存データを上書きしない
+        if (
+            os.path.exists(self.final_path)
+            or os.path.exists(self.temp_path)
+        ):
+            raise FileExistsError(
+                f"録画ファイルが既に存在します: "
+                f"{self.final_path}"
+            )
+
+        self.n = 0
+        self.first_ns = 0
+        self.last_ns = 0
+
+        if self.kind == "depth":
+            self.open_depth(packet)
+
+        elif self.kind == "ir":
+            self.writer = open_video(
+                self.temp_path,
+                IR_W, IR_H,
+                not IR_WRITE_GRAY
+            )
+
+        elif self.kind == "rgb":
+            self.writer = open_video(
+                self.temp_path,
+                RGB_W, RGB_H,
+                True
+            )
+
+        self.segment = seg
+
+    # --------------------------------------------------------
+    # Depthファイル開始
+    # --------------------------------------------------------
+
+    def open_depth(self, packet):
+
+        self.h5 = h5py.File(self.temp_path, "w")
+
+        initial_capacity = (
+            FPS * FILE_PERIOD_MIN * 60 + FPS * 4
+        )
+
+        self.h5.attrs.update({
+            "depth_scale": self.device_info["depth_scale"],
+            "width": DEPTH_W,
+            "height": DEPTH_H,
+            "fps": FPS,
+            "serial": self.device_info["serial"],
+            "firmware": self.device_info["firmware"],
+            "valid_frames": 0,
+            "timestamp_unit": "milliseconds",
+        })
+
+        self.depth_ds = self.h5.create_dataset(
+            "depth",
+            shape=(initial_capacity, DEPTH_H, DEPTH_W),
+            maxshape=(None, DEPTH_H, DEPTH_W),
+            dtype=np.uint16,
+            compression="lzf",
+            chunks=(1, DEPTH_H, DEPTH_W)
+        )
+
+        metadata_names = {
+            "ts_depth": "f8",
+            "ts_color": "f8",
+            "ts_infra": "f8",
+            "frame_no_depth": "i8",
+            "frame_no_color": "i8",
+            "frame_no_infra": "i8",
+            "host_wall_ns": "i8",
+            "host_mono_ns": "i8",
+        }
+
+        for name, dtype in metadata_names.items():
+            self.meta_ds[name] = self.h5.create_dataset(
+                name,
+                shape=(initial_capacity,),
+                maxshape=(None,),
+                dtype=dtype
+            )
+
+        # 日付ごとにカメラ情報を記録
+        date_str = packet.segment.prefix[:8]
+
+        if self.last_info_date != date_str:
+
+            info_path = os.path.join(
+                packet.segment.base_dir,
+                packet.segment.prefix + "_info.txt"
+            )
+
+            mkdir(packet.segment.base_dir)
+
+            with open(
+                info_path, "w", encoding="utf-8"
+            ) as f:
+                for k, v in self.device_info.items():
+                    f.write(f"{k}: {v}\n")
+
+                f.write("depth_comp: LZF\n")
+                f.write("recording: Async 3-Worker\n")
+
+            self.last_info_date = date_str
+
+    # --------------------------------------------------------
+    # HDF5容量拡張
+    # --------------------------------------------------------
+
+    def ensure_depth_capacity(self):
+
+        capacity = self.depth_ds.shape[0]
+
+        if self.n < capacity:
+            return
+
+        new_capacity = capacity + FPS * 10
+
+        self.depth_ds.resize(
+            (new_capacity, DEPTH_H, DEPTH_W)
+        )
+
+        for ds in self.meta_ds.values():
+            ds.resize((new_capacity,))
+
+    # --------------------------------------------------------
+    # 1フレーム保存
+    # --------------------------------------------------------
+
+    def write_packet(self, packet):
+
+        if self.kind == "depth":
+
+            self.ensure_depth_capacity()
+
+            i = self.n
+
+            self.depth_ds[i] = packet.depth
+
+            values = {
+                "ts_depth": packet.ts_depth,
+                "ts_color": packet.ts_color,
+                "ts_infra": packet.ts_ir,
+                "frame_no_depth": packet.no_depth,
+                "frame_no_color": packet.no_color,
+                "frame_no_infra": packet.no_ir,
+                "host_wall_ns": packet.wall_ns,
+                "host_mono_ns": packet.mono_ns,
+            }
+
+            for name, value in values.items():
+                self.meta_ds[name][i] = value
+
+            if (
+                (i + 1) % H5_FLUSH_FRAMES == 0
+            ):
+                self.h5.attrs["valid_frames"] = i + 1
+                self.h5.flush()
+
+        elif self.kind == "ir":
+
+            if IR_WRITE_GRAY:
+                self.writer.write(packet.ir)
+            else:
+                self.writer.write(
+                    cv.cvtColor(
+                        packet.ir,
+                        cv.COLOR_GRAY2BGR
+                    )
+                )
+
+        elif self.kind == "rgb":
+            self.writer.write(packet.rgb)
+
+        if self.n == 0:
+            self.first_ns = packet.wall_ns
+
+        self.last_ns = packet.wall_ns
+
+        self.n += 1
+        self.total_saved += 1
+
+    # --------------------------------------------------------
+    # ファイル終了
+    # --------------------------------------------------------
+
+    def close_segment(self, complete=True):
+
+        if self.segment is None:
+            return
+
+        seg = self.segment
+        n = self.n
+
+        try:
+            if self.kind == "depth" and self.h5:
+
+                if complete:
+                    self.depth_ds.resize(
+                        (n, DEPTH_H, DEPTH_W)
+                    )
+
+                    for ds in self.meta_ds.values():
+                        ds.resize((n,))
+
+                    self.h5.attrs["valid_frames"] = n
+
+                self.h5.flush()
+                self.h5.close()
+                self.h5 = None
+
+            elif self.writer is not None:
+                self.writer.release()
+                self.writer = None
+
+            if complete:
+                os.rename(
+                    self.temp_path,
+                    self.final_path
+                )
+
+                with self.manifest_lock:
+                    with open(
+                        self.manifest_path,
+                        "a",
+                        newline="",
+                        encoding="utf-8"
+                    ) as f:
+                        csv.writer(f).writerow([
+                            seg.prefix,
+                            self.kind,
+                            n,
+                            self.first_ns,
+                            self.last_ns,
+                            self.final_path
+                        ])
+
+                print(
+                    f"[SAVE] {self.kind:5s} "
+                    f"{seg.prefix} : {n} frames"
+                )
+
+        finally:
+            self.segment = None
+
+    # --------------------------------------------------------
+    # スレッド本体
+    # --------------------------------------------------------
+
+    def run(self):
+
+        success = True
+
+        try:
+            while True:
+
+                packet = self.q.get()
+
+                try:
+                    if packet is None:
+                        break
+
+                    if (
+                        self.segment is None
+                        or self.segment.index
+                        != packet.segment.index
+                    ):
+                        self.close_segment()
+                        self.start_segment(packet)
+
+                    self.write_packet(packet)
+
+                finally:
+                    self.q.task_done()
+
+        except Exception as e:
+            success = False
+            self.error = e
+            self.stop_event.set()
+            traceback.print_exc()
+
+        finally:
+            try:
+                self.close_segment(complete=success)
+            except Exception as e:
+                self.error = e
+                self.stop_event.set()
+                traceback.print_exc()
+
+            if self.h5 is not None:
+                try:
+                    self.h5.close()
+                except Exception:
+                    pass
+
+            if self.writer is not None:
+                self.writer.release()
+
+
+# ============================================================
+# 4. RealSense 初期化
+# ============================================================
+
+def init_camera():
+
+    ctx = rs.context()
+
+    if len(ctx.devices) == 0:
+        raise RuntimeError(
+            "RealSenseが接続されていません"
+        )
+
+    pipe = rs.pipeline()
+    cfg = rs.config()
+
+    cfg.enable_stream(
+        rs.stream.depth,
+        DEPTH_W, DEPTH_H,
+        rs.format.z16,
+        FPS
+    )
+
+    cfg.enable_stream(
+        rs.stream.infrared,
+        IR_W, IR_H,
+        rs.format.y8,
+        FPS
+    )
+
+    cfg.enable_stream(
+        rs.stream.color,
+        RGB_W, RGB_H,
+        rs.format.bgr8,
+        FPS
+    )
+
+    # 通常のwait_for_framesとは異なり、
+    # SDKが別途フレームを蓄積する
+    sdk_queue = rs.frame_queue(
+        SDK_QUEUE_SIZE,
+        keep_frames=True
+    )
+
+    profile = pipe.start(cfg, sdk_queue)
+
+    dev = profile.get_device()
+
+    info = {
+        "serial": dev.get_info(
+            rs.camera_info.serial_number
+        ),
+        "firmware": dev.get_info(
+            rs.camera_info.firmware_version
+        ),
+        "depth_scale": (
+            dev.first_depth_sensor().get_depth_scale()
+        ),
+    }
+
+    if dev.supports(
+        rs.camera_info.usb_type_descriptor
+    ):
+        info["usb"] = dev.get_info(
+            rs.camera_info.usb_type_descriptor
+        )
+
+    return pipe, sdk_queue, info
+
+
+# ============================================================
+# 5. キャプチャ処理
+# ============================================================
+
+def capture_loop(
+    sdk_queue,
+    workers,
+    stop_event,
+    preview_q,
+    baby_id,
+    stats
+):
+
+    start_ns = None
+    current_segment = None
+
+    last_frame_numbers = {}
+    consecutive_timeouts = 0
+
+    try:
+        while not stop_event.is_set():
+
+            if any(w.error is not None for w in workers):
+                stop_event.set()
+                break
+
+            try:
+                frame = sdk_queue.wait_for_frame(2000)
+                frames = frame.as_frameset()
+                consecutive_timeouts = 0
+
+            except RuntimeError:
+                stats["timeouts"] += 1
+                consecutive_timeouts += 1
+
+                if consecutive_timeouts >= 5:
+                    raise RuntimeError(
+                        "RealSenseからフレームが取得できません"
+                    )
+
+                continue
+
+            mono_ns = time.monotonic_ns()
+            wall_ns = time.time_ns()
+
+            dfrm = frames.get_depth_frame()
+            ifrm = frames.get_infrared_frame()
+            cfrm = frames.get_color_frame()
+
+            if not (dfrm and ifrm and cfrm):
+                stats["incomplete"] += 1
+                continue
+
+            stats["received"] += 1
+
+            frame_numbers = {
+                "depth": dfrm.get_frame_number(),
+                "ir": ifrm.get_frame_number(),
+                "rgb": cfrm.get_frame_number()
+            }
+
+            # カメラ側のフレーム番号の飛びを確認
+            for key, number in frame_numbers.items():
+
+                previous = last_frame_numbers.get(key)
+
+                if previous is not None:
+
+                    diff = number - previous
+
+                    if diff > 1:
+                        stats[f"gap_{key}"] += diff - 1
+
+                    elif diff == 0:
+                        stats[f"duplicate_{key}"] += 1
+
+                last_frame_numbers[key] = number
+
+            # 全ストリームの保存キューに空きがあるか
+            # 単一producerなので、空き確認後の投入は安全
+            if any(w.q.full() for w in workers):
+                stats["queue_drops"] += 1
+                continue
+
+            if start_ns is None:
+                start_ns = mono_ns
+
+            elapsed_ns = mono_ns - start_ns
+
+            segment_index = (
+                elapsed_ns
+                // (FILE_PERIOD_MIN * 60 * 1_000_000_000)
+            )
+
+            if (
+                current_segment is None
+                or current_segment.index != segment_index
+            ):
+                current_segment = make_segment(
+                    int(segment_index),
+                    wall_ns,
+                    baby_id
+                )
+
+            # RealSenseバッファの寿命に依存しないよう
+            # コピーして保存スレッドに渡す
+            packet = FramePacket(
+                segment=current_segment,
+
+                depth=np.asanyarray(
+                    dfrm.get_data()
+                ).copy(),
+
+                ir=np.asanyarray(
+                    ifrm.get_data()
+                ).copy(),
+
+                rgb=np.asanyarray(
+                    cfrm.get_data()
+                ).copy(),
+
+                ts_depth=dfrm.get_timestamp(),
+                ts_ir=ifrm.get_timestamp(),
+                ts_color=cfrm.get_timestamp(),
+
+                no_depth=frame_numbers["depth"],
+                no_ir=frame_numbers["ir"],
+                no_color=frame_numbers["rgb"],
+
+                wall_ns=wall_ns,
+                mono_ns=mono_ns
+            )
+
+            for w in workers:
+                w.q.put_nowait(packet)
+
+            stats["accepted"] += 1
+
+            # プレビューは保存処理に影響させない
+            if (
+                VISUALIZE
+                and stats["accepted"] % PREVIEW_EVERY == 0
+            ):
+                if preview_q.full():
+                    try:
+                        preview_q.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                try:
+                    preview_q.put_nowait(packet)
+                except queue.Full:
+                    pass
+
+    except Exception:
+        traceback.print_exc()
+        stats["capture_error"] = 1
+        stop_event.set()
+
+
+# ============================================================
+# 6. 監視ログ
+# ============================================================
+
+def monitor_loop(
+    workers,
+    stats,
+    stop_event,
+    monitor_path
+):
+
+    columns = [
+        "time",
+        "received",
+        "accepted",
+        "queue_drops",
+        "incomplete",
+        "timeouts",
+        "gap_depth",
+        "gap_ir",
+        "gap_rgb",
+        "duplicate_depth",
+        "duplicate_ir",
+        "duplicate_rgb",
+        "q_depth",
+        "q_ir",
+        "q_rgb",
+    ]
+
+    with open(
+        monitor_path, "w",
+        newline="", encoding="utf-8"
+    ) as f:
+        csv.writer(f).writerow(columns)
+
+    while not stop_event.wait(
+        STATUS_INTERVAL_SEC
+    ):
+
+        sizes = [w.q.qsize() for w in workers]
+
+        row = [
+            datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            stats["received"],
+            stats["accepted"],
+            stats["queue_drops"],
+            stats["incomplete"],
+            stats["timeouts"],
+            stats["gap_depth"],
+            stats["gap_ir"],
+            stats["gap_rgb"],
+            stats["duplicate_depth"],
+            stats["duplicate_ir"],
+            stats["duplicate_rgb"],
+            *sizes
+        ]
+
+        with open(
+            monitor_path, "a",
+            newline="", encoding="utf-8"
+        ) as f:
+            csv.writer(f).writerow(row)
+
+        print(
+            f"[STATUS] "
+            f"received={stats['received']} "
+            f"accepted={stats['accepted']} "
+            f"queue_drop={stats['queue_drops']} "
+            f"q={sizes}"
+        )
+
+
+# ============================================================
+# 7. メイン処理
+# ============================================================
+
+def main():
+
+    baby_id = input("Enter baby ID : ").strip()
+    pc_name = input("Enter PC name : ").strip()
+
+    if not baby_id or not pc_name:
+        raise ValueError(
+            "Baby IDとPC名を入力してください"
+        )
+
+    # パス区切り文字の混入を防止
+    for value in (baby_id, pc_name):
+        if (
+            value in (".", "..")
+            or "/" in value
+            or "\\" in value
+        ):
+            raise ValueError("無効なIDまたはPC名です")
+
+    mkdir(ROOT_PATH)
+
+    session_start = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    session_dir = os.path.join(
+        ROOT_PATH, baby_id
+    )
+    mkdir(session_dir)
+
+    manifest_path = os.path.join(
+        session_dir,
+        f"{session_start}_segments.csv"
+    )
+
+    monitor_path = os.path.join(
+        session_dir,
+        f"{session_start}_monitor.csv"
+    )
+
+    manifest_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    stats = {
+        "received": 0,
+        "accepted": 0,
+        "queue_drops": 0,
+        "incomplete": 0,
+        "timeouts": 0,
+        "gap_depth": 0,
+        "gap_ir": 0,
+        "gap_rgb": 0,
+        "duplicate_depth": 0,
+        "duplicate_ir": 0,
+        "duplicate_rgb": 0,
+        "capture_error": 0,
+    }
+
+    with open(
+        manifest_path, "w",
+        newline="", encoding="utf-8"
+    ) as f:
+        csv.writer(f).writerow([
+            "prefix",
+            "stream",
+            "frames",
+            "first_wall_ns",
+            "last_wall_ns",
+            "path"
+        ])
+
+    pipe = None
+    workers = []
+    capture_thread = None
+    monitor_thread = None
+    preview_q = queue.Queue(maxsize=1)
+
+    try:
+        pipe, sdk_queue, info = init_camera()
+        info["babyID"] = baby_id
+        info["pcname"] = pc_name
+
+        print("\nRealSense接続完了")
+        print("Serial:", info["serial"])
+        print("USB:", info.get("usb", "unknown"))
+
+        # 起動直後の不安定なフレームを除外
+        for _ in range(30):
+            sdk_queue.wait_for_frame(3000)
+
+        workers = [
+            SaveWorker(
+                kind,
+                stop_event,
+                manifest_path,
+                manifest_lock,
+                info
+            )
+            for kind in ("depth", "ir", "rgb")
+        ]
+
+        for w in workers:
+            w.start()
+
+        capture_thread = threading.Thread(
+            target=capture_loop,
+            args=(
+                sdk_queue,
+                workers,
+                stop_event,
+                preview_q,
+                baby_id,
+                stats
+            ),
+            name="Capture",
+            daemon=False
+        )
+
+        monitor_thread = threading.Thread(
+            target=monitor_loop,
+            args=(
+                workers,
+                stats,
+                stop_event,
+                monitor_path
+            ),
+            name="Monitor",
+            daemon=False
+        )
+
+        capture_thread.start()
+        monitor_thread.start()
+
+        if VISUALIZE:
+            for name in ("Depth", "IR", "RGB"):
+                cv.namedWindow(
+                    name, cv.WINDOW_NORMAL
+                )
+
+        print("\n録画開始")
+        print("終了: Ctrl+C")
+        if VISUALIZE:
+            print("プレビューでは q キーでも終了")
+
+        while capture_thread.is_alive():
+
+            if not VISUALIZE:
+                capture_thread.join(timeout=0.2)
+                continue
+
+            try:
+                p = preview_q.get(timeout=0.05)
+
+                depth_vis = cv.convertScaleAbs(
+                    p.depth, alpha=0.03
+                )
+
+                cv.imshow("Depth", depth_vis)
+                cv.imshow("IR", p.ir)
+                cv.imshow("RGB", p.rgb)
+
+            except queue.Empty:
+                pass
+
+            if cv.waitKey(1) & 0xFF == ord("q"):
+                stop_event.set()
+                break
+
+    except KeyboardInterrupt:
+        print("\n録画停止操作を受け付けました")
+
+    except Exception:
+        traceback.print_exc()
+        stats["capture_error"] = 1
+
+    finally:
+        stop_event.set()
+
+        if capture_thread is not None:
+            capture_thread.join()
+
+        if pipe is not None:
+            try:
+                pipe.stop()
+            except Exception:
+                traceback.print_exc()
+
+        # 各スレッドの保存キューを最後まで処理する
+        for w in workers:
+
+            if not w.is_alive():
+                continue
+
+            while w.is_alive():
+                try:
+                    w.q.put(None, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+
+        for w in workers:
+            w.join()
+
+        if monitor_thread is not None:
+            monitor_thread.join()
+
+        if VISUALIZE:
+            cv.destroyAllWindows()
+
+        # 最終統計
+        print("\n========== Recording Summary ==========")
+
+        for key, value in stats.items():
+            print(f"{key:20s}: {value}")
+
+        for w in workers:
+            print(
+                f"saved_{w.kind:14s}: {w.total_saved}"
+            )
+
+            if w.error is not None:
+                print(
+                    f"ERROR ({w.kind}): {w.error}"
+                )
+
+        print("=======================================")
+        print("録画終了")
+
+
+if __name__ == "__main__":
+    main()
+
+                
